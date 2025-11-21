@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 bnf = { git = "https://github.com/FabianVegaA/bnf.git", branch = "main" }
+clap = { version = "4.5.53", features = ["derive"] }
+clap-verbosity-flag = "3.0.4"
 env_logger = "0.11.8"
 futures = "0.3.31"
 log = "0.4.28"

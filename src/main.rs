@@ -1,8 +1,10 @@
 use bnf::{Error, Expression, Grammar, Term};
+use clap::Parser;
 use log;
 use ollama_rs::generation::completion::GenerationResponse;
 use ollama_rs::{Ollama, generation::completion::request::GenerationRequest};
 use regex::Regex;
+use std::fs;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -147,12 +149,48 @@ impl AgentLM {
     }
 
     fn generated_context(&self) -> String {
-        self.generation_context
-            .borrow()
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        let context = self.generation_context.borrow().clone();
+
+        if context.is_empty() {
+            return String::new();
+        }
+
+        let (collapsed, _) = self.collapse_expressions(&context, 0);
+
+        collapsed.join(" ")
+    }
+
+    fn collapse_expressions(
+        &self,
+        context: &[Expression],
+        start_index: usize,
+    ) -> (Vec<String>, usize) {
+        if start_index >= context.len() {
+            return (Vec::new(), start_index);
+        }
+
+        let head = &context[start_index];
+
+        head.terms_iter().fold(
+            (Vec::new(), start_index + 1),
+            |(mut acc, index), term| match term {
+                Term::Terminal(t) => {
+                    acc.push(t.clone());
+                    (acc, index)
+                }
+                Term::Nonterminal(_) => {
+                    let (expanded, new_index) = self.collapse_expressions(context, index);
+                    if expanded.is_empty() {
+                        acc.push(String::from("_"));
+                        (acc, index)
+                    } else {
+                        acc.extend(expanded);
+                        (acc, new_index)
+                    }
+                }
+                Term::AnonymousNonterminal(_) => (acc, index),
+            },
+        )
     }
 
     async fn reasoning_step(&self, options: &[String]) -> Result<String, Error> {
@@ -160,10 +198,9 @@ impl AgentLM {
         let context_str = if context.is_empty() {
             String::from("You are starting the generation.")
         } else {
-            format!(
-                "So far you have generated: \"{}\"",
-                self.generated_context()
-            )
+            let generated = self.generated_context();
+            log::info!("Generated Expression: {}", generated);
+            format!("So far you have generated: \"{}\"", generated)
         };
 
         let reasoning_prompt =
@@ -214,10 +251,10 @@ impl AgentLM {
             .map(|(i, e)| format!("{}. {}", i + 1, e.to_string()))
             .collect();
 
-        log::info!("===== REASONING STEP =====");
+        log::debug!("===== REASONING STEP =====");
         let reasoning = self.reasoning_step(&formatted_options).await?;
-        log::info!("Model reasoning: {}", reasoning);
-        log::info!("===== END REASONING =====\n");
+        log::debug!("Model reasoning: {}", reasoning);
+        log::debug!("===== END REASONING =====\n");
 
         let result = self
             .retry_chose(&options, &formatted_options, &reasoning)
@@ -246,7 +283,7 @@ impl AgentLM {
         options: &'a Vec<&'a Expression>,
     ) -> Result<&'a Expression, Error> {
         let parsed_result = result.and_then(|r| {
-            log::info!("LM response: '{}'", r.response.trim());
+            log::debug!("LM response: '{}'", r.response.trim());
             r.response
                 .trim()
                 .parse::<usize>()
@@ -262,7 +299,7 @@ impl AgentLM {
 
         let choose_expression = parsed_result.and_then(|index| {
             let array_index = index.saturating_sub(1);
-            log::info!("Parsed index: {}, array index: {}", index, array_index);
+            log::debug!("Parsed index: {}, array index: {}", index, array_index);
             options.get(array_index).ok_or(Error::ParseError(format!(
                 "Invalid response: index {} is out of bounds. Length: {}",
                 index,
@@ -271,7 +308,7 @@ impl AgentLM {
         });
 
         choose_expression.and_then(|choose| {
-            log::info!("Chosen expression: {:?}", choose);
+            log::debug!("Chosen expression: {:?}", choose);
             Ok(*choose)
         })
     }
@@ -283,9 +320,9 @@ impl AgentLM {
         reasoning: &str,
     ) -> Result<&'a Expression, Error> {
         let prompt = self.agent_prompt_with_reasoning(&formatted_options, &reasoning);
-        log::info!("===== FULL PROMPT SENT TO LM =====");
-        log::info!("{}", prompt);
-        log::info!("===== END PROMPT =====");
+        log::debug!("===== FULL PROMPT SENT TO LM =====");
+        log::debug!("{}", prompt);
+        log::debug!("===== END PROMPT =====");
 
         let mut last_error = None;
         for attempt in 1..=3 {
@@ -414,33 +451,118 @@ impl Generator<AgentLM> {
     }
 }
 
+#[derive(Parser)]
+struct Cli {
+    #[arg(short, long)]
+    grammar_path: std::path::PathBuf,
+    #[arg(short, long, default_value = "gemma3:4b-it-qat")]
+    model: String,
+    #[arg(short, long)]
+    prompt: String,
+    #[command(flatten)]
+    verbosity: clap_verbosity_flag::Verbosity,
+}
+
+fn set_verbosity(verbosity: clap_verbosity_flag::Verbosity) {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter_level(verbosity.log_level_filter())
+        .init();
+}
+
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let args = Cli::parse();
 
-    let input = "
-        <program> ::= <expr>
-        <expr>    ::= <term> | <term> '+' <expr> | <term> '-' <expr>
-        <term>    ::= <number> | <var> | '(' <expr> ')'
-        <var>     ::= 'a' | 'b' | 'c'
-        <number>  ::= '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9'
-    ";
+    set_verbosity(args.verbosity);
+
+    let input = fs::read_to_string(args.grammar_path).expect("Failed to read grammar file");
 
     match input.parse() {
         Ok(grammar) => {
-            let generated = Generator::<AgentLM>::new(
-                grammar,
-                String::from("deepseek-r1:7b"),
-                String::from("Sum the first 4 prime numbers."),
-            )
-            .generate()
-            .await;
+            let generated = Generator::<AgentLM>::new(grammar, args.model, args.prompt)
+                .generate()
+                .await;
 
             match generated {
-                Ok(result) => log::info!("LM sentence: {}", result),
+                Ok(result) => log::info!("Final Expression: {}", result),
                 Err(error) => log::error!("Something went wrong: {}!", error),
             }
         }
         Err(error) => log::error!("Error parsing grammar: {}", error),
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_collapse_expressions() {
+        let grammar = "
+            <expr> ::= <term> | <term> '+' <expr>
+            <term> ::= <number>
+            <number> ::= '1' | '2'
+        "
+        .parse::<Grammar>()
+        .unwrap();
+
+        let agent = AgentLM::new(
+            grammar,
+            String::from("test-model"),
+            String::from("test task"),
+        );
+
+        // Simulate the context based on the original structure:
+        // First Expression has multiple terms: <term> "+" <expr>
+        let context = vec![
+            Expression::from_parts(vec![
+                Term::Nonterminal(String::from("<term>")),
+                Term::Terminal(String::from("+")),
+                Term::Nonterminal(String::from("<expr>")),
+            ]),
+            Expression::from_parts(vec![Term::Nonterminal(String::from("<number>"))]),
+            Expression::from_parts(vec![Term::Terminal(String::from("1"))]),
+            Expression::from_parts(vec![Term::Nonterminal(String::from("<term>"))]),
+            Expression::from_parts(vec![Term::Nonterminal(String::from("<number>"))]),
+            Expression::from_parts(vec![Term::Terminal(String::from("2"))]),
+        ];
+
+        let (collapsed, final_index) = agent.collapse_expressions(&context, 0);
+
+        assert_eq!(collapsed, vec!["1", "+", "2"]);
+        assert_eq!(final_index, 6);
+    }
+
+    #[test]
+    fn test_collapse_expressions_with_uncovered_nonterminal() {
+        let grammar = "
+            <expr> ::= <term> | <term> '+' <expr>
+            <term> ::= <number>
+            <number> ::= '1' | '2'
+        "
+        .parse::<Grammar>()
+        .unwrap();
+
+        let agent = AgentLM::new(
+            grammar,
+            String::from("test-model"),
+            String::from("test task"),
+        );
+
+        // Context where <expr> nonterminal is not covered
+        let context = vec![
+            Expression::from_parts(vec![
+                Term::Nonterminal(String::from("<term>")),
+                Term::Terminal(String::from("+")),
+                Term::Nonterminal(String::from("<expr>")),
+            ]),
+            Expression::from_parts(vec![Term::Nonterminal(String::from("<number>"))]),
+            Expression::from_parts(vec![Term::Terminal(String::from("1"))]),
+        ];
+
+        let (collapsed, final_index) = agent.collapse_expressions(&context, 0);
+
+        assert_eq!(collapsed, vec!["1", "+", "_"]);
+        assert_eq!(final_index, 3);
+    }
 }

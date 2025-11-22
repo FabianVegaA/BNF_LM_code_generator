@@ -1,4 +1,4 @@
-# BNF Graph Visualizer
+# BNF LM Code Generator
 
 Generate code from BNF grammars using language models with step-by-step derivation.
 

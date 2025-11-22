@@ -1,0 +1,37 @@
+<program> ::= <statement_list>
+
+<statement_list> ::= <statement> | <statement_list> <statement>
+
+<statement> ::= <expression_statement> | <variable_declaration>
+
+<expression_statement> ::= <expression> ';'
+
+<variable_declaration> ::= <var_keyword> <identifier> '=' <expression> ';' | <var_keyword> <identifier> ';'
+
+<var_keyword> ::= 'var' | 'let' | 'const'
+
+<expression> ::= <assignment> | <additive> | <call_expression> | <member_expression> | <primary>
+
+<assignment> ::= <identifier> '=' <expression>
+
+<additive> ::= <primary> '+' <primary> | <primary> '-' <primary> | <primary> '*' <primary> | <primary> '/' <primary>
+
+<call_expression> ::= <member_expression> '(' <argument_list> ')' | <member_expression> '(' ')'
+
+<member_expression> ::= <identifier> '.' <identifier>
+
+<argument_list> ::= <expression> | <argument_list> ',' <expression>
+
+<primary> ::= <identifier> | <literal>
+
+<literal> ::= <string> | <number> | <boolean>
+
+<identifier> ::= 'console' | 'log' | 'x' | 'y' | 'z' | 'name' | 'message' | 'count' | 'result' | 'foo' | 'bar'
+
+<string> ::= '"' <string_content> '"'
+
+<string_content> ::= 'Hello World' | 'Hello' | 'World' | 'JavaScript' | 'Test' | ''
+
+<number> ::= '0' | '1' | '2' | '3' | '4' | '5' | '10' | '42' | '100'
+
+<boolean> ::= 'true' | 'false'

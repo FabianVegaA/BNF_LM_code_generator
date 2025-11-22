@@ -7,7 +7,9 @@ edition = "2024"
 bnf = { git = "https://github.com/FabianVegaA/bnf.git", branch = "main" }
 clap = { version = "4.5.53", features = ["derive"] }
 clap-verbosity-flag = "3.0.4"
+chrono = "0.4"
 env_logger = "0.11.8"
+fern = "0.7"
 futures = "0.3.31"
 log = "0.4.28"
 ollama-rs = "0.3.2"

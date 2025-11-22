@@ -1,4 +1,5 @@
 use bnf::{Error, Expression, Grammar, Term};
+use chrono::Local;
 use clap::Parser;
 use log;
 use ollama_rs::generation::completion::GenerationResponse;
@@ -31,12 +32,12 @@ impl<'a> RasoningPrompt<'a> {
 }
 
 const RASONING_PROMPT_TEMPLATE: &str = "
-You are a text generation agent guided by Backus-Naur Form (BNF) grammar rules.
+You are performing a step-by-step BNF grammar derivation to generate valid code.
 
-Grammar:
+Goal: {{Task}}
+
+Grammar (relevant rules):
 {{Grammar}}
-
-Task: {{Task}}
 
 {{Context}}
 
@@ -44,13 +45,18 @@ Available options to continue:
 {{Options}}
 
 Instructions:
-- Analyze what has been generated so far
-- Consider what needs to be generated next to complete the task
-- Think about which option best continues toward the goal
-- Reason step-by-step about the implications of each choice
-- Provide your reasoning in 2-3 sentences
+1. Look carefully at what has been generated so far
+2. Understand the current structure and what nonterminals need expansion
+3. Consider which option will correctly build toward the goal
+4. Each option shows what will be produced when chosen
+5. Think about the STRUCTURE you're building, not just individual tokens
 
-Respond with ONLY your reasoning, no other text.";
+Provide your reasoning in 2-3 sentences explaining:
+- What you need to generate next
+- Why the chosen option moves toward the goal
+- How it fits into the overall structure
+
+Reasoning:";
 
 impl<'a> Template for RasoningPrompt<'a> {
     fn render(&self) -> String {
@@ -81,27 +87,20 @@ impl<'a> AgentPrompt<'a> {
 }
 
 const AGENT_PROMPT_TEMPLATE: &str = "
-You are a text generation agent guided by Backus-Naur Form (BNF) grammar rules.
+You are generating code to: {{Task}}
 
-Task: {{Task}}
+Your reasoning:
+<think>{{Reasoning}}</think>
 
 {{Context}}
 
-Your previous reasoning:
-<think>
-{{Reasoning}}
-</think>
-
-Which of the following options do you choose to continue?
-
-Here are the options:
+Available options:
 {{Options}}
 
-Instructions:
-- Based on your reasoning above, choose the best option
-- You must respond **ONLY** with the number of the option you choose
-- Do not add any text, periods, or explanations
-- For example, if you choose option 2, respond with: 2
+Based on your reasoning above, choose the option number that correctly continues the derivation.
+
+CRITICAL: Respond with ONLY the option number (e.g., 2)
+Do NOT add any explanation, punctuation, or other text.
 ";
 
 impl<'a> Template for AgentPrompt<'a> {
@@ -128,12 +127,20 @@ impl<A: Agent> Generator<A> {
     }
 }
 
+#[derive(Clone)]
+struct DecisionHistory {
+    rule: String,
+    choice: String,
+    result: String,
+}
+
 struct AgentLM {
     grammar: Grammar,
     ollama: Ollama,
     model: String,
     prompt: String,
     generation_context: std::cell::RefCell<Vec<Expression>>,
+    decision_history: std::cell::RefCell<Vec<DecisionHistory>>,
 }
 
 impl AgentLM {
@@ -145,6 +152,7 @@ impl AgentLM {
             model,
             prompt,
             generation_context: std::cell::RefCell::new(Vec::new()),
+            decision_history: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -158,6 +166,73 @@ impl AgentLM {
         let (collapsed, _) = self.collapse_expressions(&context, 0);
 
         collapsed.join(" ")
+    }
+
+    fn partial_derivation(&self) -> String {
+        let context = self.generation_context.borrow();
+
+        if context.is_empty() {
+            return String::new();
+        }
+
+        let first_expr = &context[0];
+        let terms: Vec<String> = first_expr
+            .terms_iter()
+            .map(|term| match term {
+                Term::Terminal(t) => format!("'{}'", t),
+                Term::Nonterminal(nt) => nt.clone(),
+                Term::AnonymousNonterminal(_) => String::from("<anon>"),
+            })
+            .collect();
+
+        terms.join(" ")
+    }
+
+    fn format_decision_history(&self) -> String {
+        let history = self.decision_history.borrow();
+
+        if history.is_empty() {
+            return String::new();
+        }
+
+        let formatted = history
+            .iter()
+            .enumerate()
+            .map(|(i, decision)| {
+                format!(
+                    "  {}. {} → '{}' → {}",
+                    i + 1,
+                    decision.rule,
+                    decision.choice,
+                    decision.result
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!("\n\nDecision history:\n{}", formatted)
+    }
+
+    fn generated_context_display(&self) -> String {
+        let collapsed = self.generated_context();
+        let partial = self.partial_derivation();
+
+        if collapsed.is_empty() {
+            if partial.is_empty() {
+                String::from("You are starting the generation.")
+            } else {
+                format!("Current structure: {}", partial)
+            }
+        } else {
+            if partial.is_empty() {
+                format!("So far you have generated: \"{}\"", collapsed)
+            } else {
+                format!(
+                    "So far you have generated: \"{}\"\nCurrent expansion: {}",
+                    collapsed, partial
+                )
+            }
+        }
     }
 
     fn collapse_expressions(
@@ -194,14 +269,12 @@ impl AgentLM {
     }
 
     async fn reasoning_step(&self, options: &[String]) -> Result<String, Error> {
-        let context = self.generation_context.borrow();
-        let context_str = if context.is_empty() {
-            String::from("You are starting the generation.")
-        } else {
-            let generated = self.generated_context();
-            log::info!("Generated Expression: {}", generated);
-            format!("So far you have generated: \"{}\"", generated)
-        };
+        let generated = self.generated_context();
+        log::info!("Generated Expression: {}", generated);
+
+        let context_display = self.generated_context_display();
+        let history = self.format_decision_history();
+        let context_str = format!("{}{}", context_display, history);
 
         let reasoning_prompt =
             RasoningPrompt::new(&self.grammar, &self.prompt, context_str, options.join("\n"))
@@ -213,14 +286,10 @@ impl AgentLM {
 
     fn agent_prompt_with_reasoning(&self, options: &[String], reasoning: &str) -> String {
         let context = self.generation_context.borrow();
-
         let context_str = if context.is_empty() {
-            String::from("You are starting the generation.")
+            String::from("")
         } else {
-            format!(
-                "So far you have generated: \"{}\"",
-                self.generated_context()
-            )
+            self.generated_context()
         };
 
         AgentPrompt::new(
@@ -248,12 +317,30 @@ impl AgentLM {
         let formatted_options: Vec<String> = options
             .iter()
             .enumerate()
-            .map(|(i, e)| format!("{}. {}", i + 1, e.to_string()))
+            .map(|(i, e)| {
+                let terms_display: Vec<String> = e
+                    .terms_iter()
+                    .map(|term| match term {
+                        Term::Terminal(t) => format!("'{}'", t),
+                        Term::Nonterminal(nt) => nt.clone(),
+                        Term::AnonymousNonterminal(_) => String::from("<anon>"),
+                    })
+                    .collect();
+                format!(
+                    "{}. {} → produces: {}",
+                    i + 1,
+                    e.to_string(),
+                    terms_display.join(" ")
+                )
+            })
             .collect();
 
         log::debug!("===== REASONING STEP =====");
-        let reasoning = self.reasoning_step(&formatted_options).await?;
-        log::debug!("Model reasoning: {}", reasoning);
+        let reasoning = self
+            .reasoning_step(&formatted_options)
+            .await
+            .unwrap_or(String::new());
+        log::debug!("{}", reasoning);
         log::debug!("===== END REASONING =====\n");
 
         let result = self
@@ -261,11 +348,40 @@ impl AgentLM {
             .await;
 
         result.and_then(|expression| {
+            let expr_clone = (*expression).clone();
             self.generation_context
                 .borrow_mut()
-                .push((*expression).clone());
-            return Ok(expression.clone());
+                .push(expr_clone.clone());
+
+            let rule = self.get_current_nonterminal();
+            let choice = expr_clone.to_string();
+            let result_str = self.generated_context();
+
+            self.decision_history.borrow_mut().push(DecisionHistory {
+                rule,
+                choice,
+                result: result_str,
+            });
+
+            return Ok(expr_clone);
         })
+    }
+
+    fn get_current_nonterminal(&self) -> String {
+        let context = self.generation_context.borrow();
+        if context.is_empty() {
+            return String::from("<start>");
+        }
+
+        if let Some(last_expr) = context.last() {
+            for term in last_expr.terms_iter() {
+                if let Term::Nonterminal(nt) = term {
+                    return nt.clone();
+                }
+            }
+        }
+
+        String::from("<unknown>")
     }
 
     fn parse_index(response: &str) -> Result<usize, Error> {
@@ -406,6 +522,7 @@ impl AgentLM {
 impl Agent for AgentLM {
     async fn generate(&self) -> Result<String, Error> {
         self.generation_context.borrow_mut().clear();
+        self.decision_history.borrow_mut().clear();
 
         let start_rule: String;
         let first_production = self.grammar.productions_iter().next();
@@ -459,21 +576,66 @@ struct Cli {
     model: String,
     #[arg(short, long)]
     prompt: String,
+    #[arg(long, help = "Disable logging to file (only log to console)")]
+    no_log_file: bool,
     #[command(flatten)]
     verbosity: clap_verbosity_flag::Verbosity,
 }
 
-fn set_verbosity(verbosity: clap_verbosity_flag::Verbosity) {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .filter_level(verbosity.log_level_filter())
-        .init();
+fn setup_logging(
+    verbosity: clap_verbosity_flag::Verbosity,
+    enable_file_logging: bool,
+) -> Result<(), fern::InitError> {
+    let console_level = verbosity.log_level_filter();
+
+    let format =
+        |out: fern::FormatCallback, message: &std::fmt::Arguments, record: &log::Record| {
+            out.finish(format_args!(
+                "[{} {} {}] {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.target(),
+                message
+            ))
+        };
+
+    let console_dispatch = fern::Dispatch::new()
+        .format(format)
+        .level(console_level)
+        .chain(std::io::stdout());
+
+    if enable_file_logging {
+        std::fs::create_dir_all("logs").ok();
+
+        let log_file = format!(
+            "logs/bnf-visualizer-{}.log",
+            Local::now().format("%Y%m%d-%H%M%S")
+        );
+
+        let file_dispatch = fern::Dispatch::new()
+            .format(format)
+            .level(log::LevelFilter::Debug)
+            .chain(fern::log_file(&log_file)?);
+
+        fern::Dispatch::new()
+            .chain(console_dispatch)
+            .chain(file_dispatch)
+            .apply()?;
+
+        log::info!("Logging to console and file: {}", log_file);
+    } else {
+        console_dispatch.apply()?;
+        log::info!("Logging to console only");
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() {
     let args = Cli::parse();
 
-    set_verbosity(args.verbosity);
+    setup_logging(args.verbosity, !args.no_log_file).expect("Failed to initialize logging");
 
     let input = fs::read_to_string(args.grammar_path).expect("Failed to read grammar file");
 
@@ -512,8 +674,6 @@ mod tests {
             String::from("test task"),
         );
 
-        // Simulate the context based on the original structure:
-        // First Expression has multiple terms: <term> "+" <expr>
         let context = vec![
             Expression::from_parts(vec![
                 Term::Nonterminal(String::from("<term>")),
@@ -549,7 +709,6 @@ mod tests {
             String::from("test task"),
         );
 
-        // Context where <expr> nonterminal is not covered
         let context = vec![
             Expression::from_parts(vec![
                 Term::Nonterminal(String::from("<term>")),
@@ -564,5 +723,124 @@ mod tests {
 
         assert_eq!(collapsed, vec!["1", "+", "_"]);
         assert_eq!(final_index, 3);
+    }
+
+    #[test]
+    fn test_collapse_javascript_console_log() {
+        let grammar_str = std::fs::read_to_string("grammars/javascript.bnf")
+            .expect("Failed to read javascript.bnf");
+
+        let grammar = grammar_str.parse::<Grammar>().unwrap();
+
+        let agent = AgentLM::new(
+            grammar,
+            String::from("test-model"),
+            String::from("test task"),
+        );
+
+        let context = vec![
+            Expression::from_parts(vec![
+                Term::Nonterminal(String::from("<member_expression>")),
+                Term::Terminal(String::from("(")),
+                Term::Nonterminal(String::from("<argument_list>")),
+                Term::Terminal(String::from(")")),
+                Term::Terminal(String::from(";")),
+            ]),
+            Expression::from_parts(vec![
+                Term::Nonterminal(String::from("<identifier>")),
+                Term::Terminal(String::from(".")),
+                Term::Nonterminal(String::from("<identifier>")),
+            ]),
+            Expression::from_parts(vec![Term::Terminal(String::from("console"))]),
+            Expression::from_parts(vec![Term::Terminal(String::from("log"))]),
+            Expression::from_parts(vec![Term::Nonterminal(String::from("<expression>"))]),
+            Expression::from_parts(vec![Term::Nonterminal(String::from("<primary>"))]),
+            Expression::from_parts(vec![Term::Nonterminal(String::from("<literal>"))]),
+            Expression::from_parts(vec![Term::Nonterminal(String::from("<string>"))]),
+            Expression::from_parts(vec![
+                Term::Terminal(String::from("\"")),
+                Term::Nonterminal(String::from("<string_content>")),
+                Term::Terminal(String::from("\"")),
+            ]),
+            Expression::from_parts(vec![Term::Terminal(String::from("Hello World"))]),
+        ];
+
+        let (collapsed, final_index) = agent.collapse_expressions(&context, 0);
+
+        assert_eq!(
+            collapsed,
+            vec![
+                "console",
+                ".",
+                "log",
+                "(",
+                "\"",
+                "Hello World",
+                "\"",
+                ")",
+                ";"
+            ]
+        );
+        assert_eq!(final_index, 10);
+    }
+
+    #[test]
+    fn test_decision_history_and_partial_derivation() {
+        let grammar = "
+            <expr> ::= <term> | <term> '+' <expr>
+            <term> ::= <number>
+            <number> ::= '1' | '2'
+        "
+        .parse::<Grammar>()
+        .unwrap();
+
+        let agent = AgentLM::new(
+            grammar,
+            String::from("test-model"),
+            String::from("test task"),
+        );
+
+        agent
+            .generation_context
+            .borrow_mut()
+            .push(Expression::from_parts(vec![
+                Term::Nonterminal(String::from("<term>")),
+                Term::Terminal(String::from("+")),
+                Term::Nonterminal(String::from("<expr>")),
+            ]));
+
+        let partial = agent.partial_derivation();
+        assert_eq!(partial, "<term> '+' <expr>");
+
+        agent
+            .generation_context
+            .borrow_mut()
+            .push(Expression::from_parts(vec![Term::Nonterminal(
+                String::from("<number>"),
+            )]));
+        agent
+            .generation_context
+            .borrow_mut()
+            .push(Expression::from_parts(vec![Term::Terminal(String::from(
+                "1",
+            ))]));
+
+        let generated = agent.generated_context();
+        assert_eq!(generated, "1 + _");
+
+        agent.decision_history.borrow_mut().push(DecisionHistory {
+            rule: String::from("<expr>"),
+            choice: String::from("<term> '+' <expr>"),
+            result: String::from("1 + _"),
+        });
+
+        let history = agent.format_decision_history();
+        assert!(history.contains("Decision history:"));
+        assert!(history.contains("<expr>"));
+        assert!(history.contains("<term> '+' <expr>"));
+
+        let display = agent.generated_context_display();
+        assert!(display.contains("So far you have generated"));
+        assert!(display.contains("1 + _"));
     }
 }

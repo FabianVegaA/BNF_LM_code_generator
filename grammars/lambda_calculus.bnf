@@ -1,0 +1,3 @@
+<expr> ::= <term> | 'λ' <var> '.' <expr> | <expr> <expr>
+<term> ::= <var> | '(' <expr> ')'
+<var> ::= 'x' | 'y' | 'z' | 'f' | 'g'

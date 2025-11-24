@@ -235,6 +235,67 @@ impl AgentLM {
         }
     }
 
+    fn get_expansion_display(&self, expanding_nonterminal: &str) -> String {
+        let context = self.generation_context.borrow();
+
+        if context.is_empty() {
+            return format!("Expanding: {}", expanding_nonterminal);
+        }
+
+        // Get the first expression and find which position the nonterminal is at
+        let first_expr = &context[0];
+        let mut nonterminal_index = 0;
+        let mut found = false;
+
+        let terms_display: Vec<String> = first_expr
+            .terms_iter()
+            .enumerate()
+            .map(|(idx, term)| {
+                let display = match term {
+                    Term::Terminal(t) => format!("'{}'", t),
+                    Term::Nonterminal(nt) => {
+                        if nt == expanding_nonterminal && !found {
+                            found = true;
+                            nonterminal_index = idx;
+                        }
+                        nt.clone()
+                    }
+                    Term::AnonymousNonterminal(_) => String::from("<anon>"),
+                };
+                display
+            })
+            .collect();
+
+        let structure = terms_display.join(" ");
+
+        if found {
+            // Calculate character position and length for the underline
+            let mut char_position = 9;
+            for (idx, term) in terms_display.iter().enumerate() {
+                if idx == nonterminal_index {
+                    break;
+                }
+                char_position += term.len() + 1; // +1 for space
+            }
+
+            let expanding_term_len = terms_display[nonterminal_index].len();
+            let underline = format!(
+                "{:width$}{}",
+                "",
+                "^".repeat(expanding_term_len),
+                width = char_position
+            );
+            let marker = format!("{:width$}expanding this one", "", width = char_position);
+
+            format!("Current: {}\n{}\n{}", structure, underline, marker)
+        } else {
+            format!(
+                "Current: {}\nExpanding: {}",
+                structure, expanding_nonterminal
+            )
+        }
+    }
+
     fn collapse_expressions(
         &self,
         context: &[Expression],
@@ -268,17 +329,26 @@ impl AgentLM {
         )
     }
 
-    async fn reasoning_step(&self, options: &[String]) -> Result<String, Error> {
+    async fn reasoning_step(
+        &self,
+        options: &[String],
+        expanding_nonterminal: &str,
+    ) -> Result<String, Error> {
         let generated = self.generated_context();
         log::info!("Generated Expression: {}", generated);
 
+        let expansion_display = self.get_expansion_display(expanding_nonterminal);
         let context_display = self.generated_context_display();
         let history = self.format_decision_history();
-        let context_str = format!("{}{}", context_display, history);
+        let context_str = format!("{}\n\n{}{}", expansion_display, context_display, history);
 
         let reasoning_prompt =
             RasoningPrompt::new(&self.grammar, &self.prompt, context_str, options.join("\n"))
                 .render();
+
+        log::debug!("===== REASONING PROMPT =====");
+        log::debug!("{}", reasoning_prompt);
+        log::debug!("===== END REASONING PROMPT =====");
 
         let response = self.generation_request(&reasoning_prompt).await?;
         Ok(response.response.trim().to_string())
@@ -309,43 +379,55 @@ impl AgentLM {
             .map_err(|e| Error::GenerateError(format!("Ollama error: {}", e)))
     }
 
-    async fn choose(&self, options: &Vec<&Expression>) -> Result<Expression, Error> {
+    async fn choose(
+        &self,
+        options: &Vec<&Expression>,
+        expanding_nonterminal: &str,
+    ) -> Result<Expression, Error> {
         if options.len() == 1 {
-            return Ok(options[0].clone());
+            let expression = options[0].clone();
+            self.generation_context
+                .borrow_mut()
+                .push(expression.clone());
+
+            // Record the decision
+            let rule = self.get_current_nonterminal();
+            let choice = expression.to_string();
+            let result_str = self.generated_context();
+
+            self.decision_history.borrow_mut().push(DecisionHistory {
+                rule,
+                choice,
+                result: result_str,
+            });
+
+            return Ok(expression);
         }
 
-        let formatted_options: Vec<String> = options
+        let reasoning_options: Vec<String> = options
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let terms_display: Vec<String> = e
-                    .terms_iter()
-                    .map(|term| match term {
-                        Term::Terminal(t) => format!("'{}'", t),
-                        Term::Nonterminal(nt) => nt.clone(),
-                        Term::AnonymousNonterminal(_) => String::from("<anon>"),
-                    })
-                    .collect();
-                format!(
-                    "{}. {} → produces: {}",
-                    i + 1,
-                    e.to_string(),
-                    terms_display.join(" ")
-                )
+                let preview = self.simulate_option_preview(e);
+                format!("{}. {} → {}", i + 1, e.to_string(), preview)
             })
+            .collect();
+
+        let agent_options: Vec<String> = options
+            .iter()
+            .enumerate()
+            .map(|(i, e)| format!("{}. {}", i + 1, e.to_string()))
             .collect();
 
         log::debug!("===== REASONING STEP =====");
         let reasoning = self
-            .reasoning_step(&formatted_options)
+            .reasoning_step(&reasoning_options, expanding_nonterminal)
             .await
             .unwrap_or(String::new());
         log::debug!("{}", reasoning);
         log::debug!("===== END REASONING =====\n");
 
-        let result = self
-            .retry_chose(&options, &formatted_options, &reasoning)
-            .await;
+        let result = self.retry_chose(&options, &agent_options, &reasoning).await;
 
         result.and_then(|expression| {
             let expr_clone = (*expression).clone();
@@ -382,6 +464,33 @@ impl AgentLM {
         }
 
         String::from("<unknown>")
+    }
+
+    fn simulate_option_preview(&self, option: &Expression) -> String {
+        let current_context = self.generated_context();
+
+        let mut simulated_context = self.generation_context.borrow().clone();
+        simulated_context.push(option.clone());
+
+        let temp_agent = AgentLM::new(
+            self.grammar.clone(),
+            self.model.clone(),
+            self.prompt.clone(),
+        );
+        *temp_agent.generation_context.borrow_mut() = simulated_context;
+
+        let preview = temp_agent.generated_context();
+
+        let only_underscores =
+            !preview.is_empty() && preview.chars().all(|c| c == '_' || c.is_whitespace());
+
+        if preview.is_empty() || only_underscores {
+            String::from("expands structure")
+        } else if current_context == preview {
+            String::from("continues")
+        } else {
+            format!("produces: \"{}\"", preview)
+        }
     }
 
     fn parse_index(response: &str) -> Result<usize, Error> {
@@ -474,7 +583,7 @@ impl AgentLM {
 
             let expressions = production.rhs_iter().collect::<Vec<&Expression>>();
 
-            let expression = match self.choose(&expressions).await {
+            let expression = match self.choose(&expressions, ident).await {
                 Ok(e) => e,
                 Err(e) => {
                     return Err(e);
@@ -501,7 +610,7 @@ impl AgentLM {
                 Term::Terminal(t) => Ok(t.clone()),
                 Term::AnonymousNonterminal(rhs) => {
                     let rhs_refs: Vec<&Expression> = rhs.iter().collect();
-                    let expression = match self.choose(&rhs_refs).await {
+                    let expression = match self.choose(&rhs_refs, "<anonymous>").await {
                         Ok(e) => e,
                         Err(e) => return Err(e),
                     };
@@ -842,5 +951,93 @@ mod tests {
         let display = agent.generated_context_display();
         assert!(display.contains("So far you have generated"));
         assert!(display.contains("1 + _"));
+    }
+
+    #[test]
+    fn test_option_preview_simulation() {
+        let grammar = "
+            <expr> ::= <term> | <term> '+' <expr>
+            <term> ::= <number>
+            <number> ::= '1' | '2'
+        "
+        .parse::<Grammar>()
+        .unwrap();
+
+        let agent = AgentLM::new(
+            grammar,
+            String::from("test-model"),
+            String::from("test task"),
+        );
+
+        let option = Expression::from_parts(vec![Term::Nonterminal(String::from("<term>"))]);
+        let preview = agent.simulate_option_preview(&option);
+        assert_eq!(preview, "expands structure");
+
+        agent
+            .generation_context
+            .borrow_mut()
+            .push(Expression::from_parts(vec![
+                Term::Nonterminal(String::from("<term>")),
+                Term::Terminal(String::from("+")),
+                Term::Nonterminal(String::from("<expr>")),
+            ]));
+        agent
+            .generation_context
+            .borrow_mut()
+            .push(Expression::from_parts(vec![Term::Nonterminal(
+                String::from("<number>"),
+            )]));
+
+        let option_terminal = Expression::from_parts(vec![Term::Terminal(String::from("1"))]);
+        let preview = agent.simulate_option_preview(&option_terminal);
+        assert!(preview.contains("produces"));
+        assert!(preview.contains("1 + _"));
+    }
+
+    #[test]
+    fn test_expansion_display_with_complex_structure() {
+        let grammar = "
+            <call_expression> ::= <member_expression> '(' <argument_list> ')'
+            <member_expression> ::= <identifier> '.' <identifier>
+            <identifier> ::= 'console' | 'log'
+        "
+        .parse::<Grammar>()
+        .unwrap();
+
+        let agent = AgentLM::new(
+            grammar,
+            String::from("test-model"),
+            String::from("test task"),
+        );
+
+        // Add a complex expression to context
+        agent
+            .generation_context
+            .borrow_mut()
+            .push(Expression::from_parts(vec![
+                Term::Nonterminal(String::from("<identifier>")),
+                Term::Terminal(String::from(".")),
+                Term::Nonterminal(String::from("<identifier>")),
+                Term::Terminal(String::from("(")),
+                Term::Nonterminal(String::from("<argument_list>")),
+                Term::Terminal(String::from(")")),
+            ]));
+
+        // Test expansion display for the first identifier
+        let display = agent.get_expansion_display("<identifier>");
+
+        println!("Expansion display:\n{}", display);
+
+        // Should show the structure with underline on first <identifier>
+        assert!(display.contains("Current: <identifier> '.' <identifier> '(' <argument_list> ')'"));
+        assert!(display.contains("^^^^^^^^^^^^"));
+        assert!(display.contains("expanding this one"));
+
+        // Verify the underline is at the correct position
+        let lines: Vec<&str> = display.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("Current:"));
+        assert!(lines[1].starts_with("^^^^^^^^^^^^")); // underline at start
+        assert!(lines[2].starts_with("expanding this one"));
     }
 }
